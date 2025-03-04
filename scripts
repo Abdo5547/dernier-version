@@ -1,0 +1,31 @@
+#!/bin/bash
+
+echo "🚀 Mise à jour du système..."
+sudo apt update && sudo apt upgrade -y
+
+echo "📌 Installation de Terraform..."
+wget -O terraform.zip https://releases.hashicorp.com/terraform/1.6.0/terraform_1.6.0_linux_amd64.zip
+unzip terraform.zip
+sudo mv terraform /usr/local/bin/
+rm terraform.zip
+terraform -version
+
+echo "📌 Installation d'Ansible..."
+sudo apt install -y ansible
+ansible --version
+
+echo "📌 Installation de Docker..."
+sudo apt install -y docker.io
+sudo systemctl start docker
+sudo systemctl enable docker
+sudo usermod -aG docker $USER
+
+echo "📌 Installation de AWS CLI..."
+sudo apt install -y awscli
+aws --version
+
+echo "📌 Installation de Kubectl..."
+sudo apt install -y kubectl
+kubectl version --client
+
+echo "✅ Installation terminée ! Déconnecte-toi et reconnecte-toi pour que les changements prennent effet."

@@ -1,0 +1,201 @@
+---
+- name: Configure Kubernetes Cluster with Docker
+  hosts: all
+  become: yes
+  vars:
+    k8s_version: "1.28.15-00"
+    docker_version: "5:24.0.7-1~ubuntu.22.04~jammy"
+    pod_cidr: "192.168.1.0/16"
+    calico_version: "v3.27.0"
+
+  tasks:
+    # Pré-requis Python
+    - name: Ensure Python3 is installed (Bootstrap)
+      raw: test -e /usr/bin/python3 || (apt-get update && apt-get install -y python3)
+      changed_when: false
+
+    # Collecte des facts sur les paquets installés
+    - name: Gather package facts
+      package_facts:
+        manager: auto
+
+    # Vérifier si Docker est installé
+    - name: Check if Docker is installed
+      shell: dpkg -l | grep -q docker-ce
+      register: docker_check
+      ignore_errors: yes
+      changed_when: false
+
+    # Installation Docker
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+      when: docker_check.rc != 0
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+      when: docker_check.rc != 0
+
+    - name: Install Docker
+      apt:
+        name: "docker-ce={{ docker_version }}"
+        state: present
+        update_cache: yes
+      when: docker_check.rc != 0
+      notify:
+        - Enable Docker
+        - Restart Docker
+
+    # Configuration Docker
+    - name: Ensure /etc/docker directory exists
+      file:
+        path: /etc/docker
+        state: directory
+        mode: '0755'
+
+    - name: Configure Docker daemon
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "exec-opts": ["native.cgroupdriver=systemd"],
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "100m"
+            }
+          }
+      notify: Restart Docker
+
+    # Installation Kubernetes
+    - name: Check if Kubernetes is already installed
+      shell: "dpkg -l | grep -E 'kubelet|kubeadm|kubectl'"
+      register: k8s_installed
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Add Kubernetes GPG key
+      apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present
+      when: k8s_installed.rc != 0
+
+    - name: Add Kubernetes repo
+      apt_repository:
+        repo: "deb https://apt.kubernetes.io/ kubernetes-jammy main"
+        state: present
+        filename: kubernetes
+      when: k8s_installed.rc != 0
+
+    - name: Install Kubernetes components
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - kubelet={{ k8s_version }}
+        - kubeadm={{ k8s_version }}
+        - kubectl={{ k8s_version }}
+      notify: Restart kubelet
+      when: k8s_installed.rc != 0
+
+
+    # Configuration système
+    - name: Disable swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Disable swap permanently
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^/swap.img'
+        state: absent
+
+    - name: Load kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - br_netfilter
+        - overlay
+
+    - name: Configure sysctl
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+      loop:
+        - { key: "net.bridge.bridge-nf-call-iptables", value: "1" }
+        - { key: "net.ipv4.ip_forward", value: "1" }
+
+  handlers:
+    - name: Enable Docker
+      systemd:
+        name: docker
+        enabled: yes
+
+    - name: Restart Docker
+      systemd:
+        name: docker
+        state: restarted
+
+    - name: Restart kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+
+- name: Configure Master Node
+  hosts: master
+  become: yes
+  vars:
+    pod_cidr: "192.168.1.0/16"
+  tasks:
+    
+    - name: Check if cluster is already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: cluster_initialized
+
+    - name: Initialize cluster
+      command: kubeadm init --pod-network-cidr={{ pod_cidr }} --ignore-preflight-errors=Swap
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Configure kubectl for user
+      block:
+        - name: Create .kube directory
+          file:
+            path: "~{{ ansible_user }}/.kube"
+            state: directory
+
+        - name: Copy admin config
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: "~{{ ansible_user }}/.kube/config"
+            remote_src: yes
+            owner: "{{ ansible_user }}"
+            group: "{{ ansible_user }}"
+      when: not lookup('file', ansible_env.HOME + "/.kube/config", errors='ignore')
+
+
+- name: Configuration des Workers Kubernetes
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Vérifier si le node est déjà joint
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_installed
+
+    - name: Afficher la commande de jointure
+      debug:
+        var: hostvars[groups['masters'][0]]['join_command']
+
+    - name: Joindre le cluster
+      shell: "{{ hostvars[groups['masters'][0]]['join_command'] }}"
+      when:
+        - hostvars[groups['masters'][0]]['join_command'] is defined
+        - not kubelet_installed.stat.exists
+
